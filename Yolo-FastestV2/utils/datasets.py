@@ -85,16 +85,10 @@ class TensorDataset():
         self.img_formats = ['bmp', 'jpg', 'jpeg', 'png']
         self.imgaug = imgaug
 
-        # TODO: modify this path in your case
-        base_path = "/content/gdrive/MyDrive/YoloFastestResearch/Pre-thesis/Dataset/Facemask/train/"
-
         # 数据检查
         with open(self.path, 'r') as f:
             for line in f.readlines():
-                filename = line.strip()
-                data_path = base_path + filename  # Prepend the base path
-                # print(f"Processing: {data_path}")  # Debugging output
-
+                data_path = line.strip()
                 if os.path.exists(data_path):
                     img_type = data_path.split(".")[-1]
                     if img_type not in self.img_formats:
@@ -137,7 +131,7 @@ class TensorDataset():
     def __len__(self):
         return len(self.data_list)
 
-
+ 
 if __name__ == "__main__":
     data = TensorDataset("../../Dataset/Facemask/train.txt")
     img, label = data.__getitem__(0)
