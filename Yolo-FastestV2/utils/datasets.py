@@ -133,7 +133,7 @@ class TensorDataset():
 
 
 if __name__ == "__main__":
-    data = TensorDataset("/home/xuehao/Desktop/TMP/pytorch-yolo/widerface/train.txt")
+    data = TensorDataset("../../Dataset/Facemask/train.txt")
     img, label = data.__getitem__(0)
     print(img.shape)
     print(label.shape)
