@@ -92,7 +92,7 @@ def kmeans(X,centroids,eps,anchor_file, width_in_cfg_file, height_in_cfg_file):
             return
 
         #calculate new centroids
-        centroid_sums=np.zeros((k,dim),np.float)
+        centroid_sums=np.zeros((k,dim),float)
         for i in range(N):
             centroid_sums[assignments[i]]+=X[i]        
         for j in range(k):            
@@ -137,6 +137,8 @@ def main(argv):
 
         line = line.replace('.jpg','.txt')
         line = line.replace('.png','.txt')
+        # If label files are in a different directory (e.g., 'train/labels/'):
+        line = '../Dataset/Facemask/train/' + line.split('/')[-1]
         print(line)
         f2 = open(line)
         for line in f2.readlines():
