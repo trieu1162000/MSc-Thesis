@@ -21,7 +21,7 @@ TBU
 This experimental demo illustrates the model's deployment on an MCU, capturing real-time camera input and rendering detections on a TFT LCD at approximately 10 FPS. However, this test version is not used in my thesis due to its lower mean Average Precision (mAP), which impacts detection accuracy.
 
 <video width="640" height="360" controls>
-  <source src="RawDemo.mp4" type="video/mp4">
+  <source src="https://github.com/trieu1162000/MSc-Thesis/blob/main/Demo/RawDemo.mp4" type="video/mp4">
   Your browser does not support the video tag.
 </video>
 
