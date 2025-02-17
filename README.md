@@ -20,4 +20,6 @@ This repository is part of my MSc thesis, focusing on deploying a YOLO-based dee
 - **[`Demo/`](./Demo/)** — Contains parsing scripts and example applications to test the deployed model on STM32.  
 
 ## References
-[TBU](TBU)
+- Model - **[`YOLOFastestv1`](https://github.com/dogqiuqiu/Yolo-Fastest)**
+- Dataset from Robolow - **[`Hard Hat Universe Dataset`]( https://universe.roboflow.com/universe-datasets/hard-hatuniverse-0dy7t)**
+- Model Quantization - **[`Tensorflow Lite Conversion`](https://www.tensorflow.org/model_optimization/guide/quantization/post_training)**
