@@ -20,7 +20,9 @@ TBU
 ## Others
 This experimental demo illustrates the model's deployment on an MCU, capturing real-time camera input and rendering detections on a TFT LCD at approximately 10 FPS. However, this test version is not used in my thesis due to its lower mean Average Precision (mAP), which impacts detection accuracy.
 
-https://github.com/user-attachments/assets/4007471b-7130-4bf8-93dc-eac93aaf5b90
+https://github.com/user-attachments/assets/8472b4e9-d70c-4f9b-bd1e-22a9e4152221
+
+
 
 ---
 
