@@ -4,7 +4,20 @@
 This demo showcases the deployment of a custom YOLO-Fastest model on an STM32 microcontroller. The chosen custom model achieves inference speeds of approximately 2.5 FPS on the MCU.
 
 ## Result
-TBU
+> Metrics Comparision
+
+![metrics comparision table](../imgs/metrics_comparision_table.png)
+
+![metrics comparision](../imgs/metrics_comparision.png)
+
+
+> Params & BLOPS comparision
+
+![params & blops comparision](../imgs/params_blops_comparision.png)
+
+> MACC & RAM consume on STM32 comparision
+
+![macc & ram comparision](../imgs/macc_ram_comparision.png)
 
 ## Demo
 > YOLO output decoding
