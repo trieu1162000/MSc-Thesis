@@ -13,11 +13,25 @@ This demo showcases the deployment of a custom YOLO-Fastest model on an STM32 mi
 
 > Params & BLOPS comparision
 
-![params & blops comparision](../imgs/params_blops_comparision.png)
+![params & blops comparison](../imgs/params_blops_comparision.png)
 
-> MACC & RAM consume on STM32 comparision
+Model 1: YOLOv4 model  
+Model 2: YOLOv4-tiny model  
+Model 3: Original model (YOLO-Fastest)  
+Model 4: Original model combined with pruning  
+Model 5: Original model combined with input grayscale  
+Model 6: Original model combined with pruning and input grayscale  
+Model 7: Original model combined with pruning, input grayscale, and SAM block (model selected for hardware deployment)
 
-![macc & ram comparision](../imgs/macc_ram_comparision.png)
+> MACC, Flash & RAM consume on STM32 comparision
+
+![macc, flash & ram comparison](../imgs/macc_flash_ram_comparision.png)
+
+Model 1: Original model (YOLO-Fastest)  
+Model 2: Original model combined with pruning  
+Model 3: Original model combined with input grayscale  
+Model 4: Original model combined with pruning and input grayscale  
+Model 5: Original model combined with pruning, input grayscale, and SAM block (model selected for hardware deployment)
 
 ## Demo
 > YOLO output decoding
