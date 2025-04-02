@@ -48,7 +48,7 @@ This demo showcases the deployment of a custom YOLO-Fastest model on an STM32 mi
 - **Model 2**: Original model combined with pruning  
 - **Model 3**:  Original model combined with input grayscale  
 - **Model 4**: Original model combined with pruning and input grayscale  
-- **Model 5**: Original model combined with pruning, input grayscale, and SAM block (model selected for hardware deployment)
+- **Model 5**: Original model combined with pruning, input grayscale, and SAM block (**model selected for hardware deployment**)
 
 ## **Demo**
 > **YOLO output decoding**
