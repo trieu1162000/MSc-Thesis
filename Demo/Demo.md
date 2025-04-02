@@ -8,7 +8,7 @@ This demo showcases the deployment of a custom YOLO-Fastest model on an STM32 mi
 
 ![metrics comparision](../imgs/metrics_comparision.png)
 
-| Mô hình | mAP (%) | Precision | Recall | F1-Score | Params (MB) | BLOPS  |
+| Model   | mAP (%) | Precision | Recall | F1-Score | Params (MB) | BLOPS  |
 |---------|--------|-----------|--------|----------|-------------|--------|
 | 1       | 95.43  | 0.9       | 0.92   | 0.91     | 250.037     | 35.249 |
 | 2       | 89.18  | 0.86      | 0.86   | 0.86     | 22.980      | 4.017  |
@@ -35,7 +35,7 @@ This demo showcases the deployment of a custom YOLO-Fastest model on an STM32 mi
 
 ![macc, flash & ram comparison](../imgs/macc_flash_ram_comparision.png)
 
-| Mô hình | MACC (M) | Flash (KB) | RAM (KB) | STM32H743 |
+| Model   | MACC (M) | Flash (KB) | RAM (KB) | STM32H743 |
 |---------|----------|------------|----------|-----------|
 | 1       | 119.15   | 434.77     | **<span style="color:red;">1,230.0</span>** | ❌ |
 | 2       | 48.23    | 436.26     | **<span style="color:red;">1,230.0</span>** | ❌ |
