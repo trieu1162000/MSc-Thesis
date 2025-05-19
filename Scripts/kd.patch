@@ -1,0 +1,517 @@
+diff --git a/src/darknet.c b/src/darknet.c
+index 13ab75f..78cc05c 100644
+--- a/src/darknet.c
++++ b/src/darknet.c
+@@ -11,7 +11,7 @@
+ #include "dark_cuda.h"
+ #include "blas.h"
+ #include "connected_layer.h"
+-
++#include "knowlege_distillation.h"
+ 
+ extern void predict_classifier(char *datacfg, char *cfgfile, char *weightfile, char *filename, int top);
+ extern void run_voxel(int argc, char **argv);
+@@ -552,6 +552,8 @@ int main(int argc, char **argv)
+         visualize(argv[2], (argc > 3) ? argv[3] : 0);
+     } else if (0 == strcmp(argv[1], "imtest")){
+         test_resize(argv[2]);
++    } else if (0 == strcmp(argv[1], "distill")){
++        run_knowledge_distill(argc - 1, argv + 1);
+     } else {
+         fprintf(stderr, "Not an option: %s\n", argv[1]);
+     }
+diff --git a/src/knowledge_distillation.c b/src/knowledge_distillation.c
+new file mode 100644
+index 0000000..7a73771
+--- /dev/null
++++ b/src/knowledge_distillation.c
+@@ -0,0 +1,443 @@
++/**
++ * knowledge_distill.c
++ * Knowledge distillation implementation as an extension to darknet
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++#include <math.h>
++#include "knowlege_distillation.h"
++#include "blas.h"
++#include "darknet.h"
++#include "network.h"
++#include "parser.h"
++
++// Extract features from detection layer for knowledge distillation
++float *extract_detection_features(layer l, int *feature_size) {
++    if (!l.output || l.outputs <= 0) {
++        *feature_size = 0;
++        return NULL;
++    }
++    
++    *feature_size = l.outputs;
++    float *features = calloc(*feature_size, sizeof(float));
++    if (!features) {
++        fprintf(stderr, "Memory allocation failed for detection features\n");
++        *feature_size = 0;
++        return NULL;
++    }
++    
++    // Copy layer outputs directly
++    memcpy(features, l.output, l.outputs * sizeof(float));
++    return features;
++}
++
++// Apply temperature to logits
++void apply_temperature(float *logits, int size, float temperature) {
++    for (int i = 0; i < size; i++) {
++        logits[i] /= temperature;
++    }
++}
++
++// Compute KL divergence loss for knowledge distillation
++float compute_kd_loss(float *teacher_logits, float *student_logits, int size, float temperature) {
++    if (!teacher_logits || !student_logits || size <= 0) {
++        return 0.0f;
++    }
++
++    // Create copies of the logits to apply temperature
++    float *t_logits = calloc(size, sizeof(float));
++    float *s_logits = calloc(size, sizeof(float));
++    float *t_probs = calloc(size, sizeof(float));
++    float *s_probs = calloc(size, sizeof(float));
++    
++    if (!t_logits || !s_logits || !t_probs || !s_probs) {
++        if (t_logits) free(t_logits);
++        if (s_logits) free(s_logits);
++        if (t_probs) free(t_probs);
++        if (s_probs) free(s_probs);
++        return 0.0f;
++    }
++    
++    memcpy(t_logits, teacher_logits, size * sizeof(float));
++    memcpy(s_logits, student_logits, size * sizeof(float));
++
++    // Apply softmax with temperature to both
++    softmax(t_logits, size, temperature, t_probs, 1);
++    softmax(s_logits, size, temperature, s_probs, 1);
++
++    // Compute KL divergence: sum(t_probs * log(t_probs / s_probs))
++    float loss = 0.0f;
++    float epsilon = 1e-7f;
++    for (int i = 0; i < size; i++) {
++        if (t_probs[i] > epsilon) {
++            loss += t_probs[i] * log((t_probs[i] + epsilon) / (s_probs[i] + epsilon));
++        }
++    }
++
++    // Clean up
++    free(t_logits);
++    free(s_logits);
++    free(t_probs);
++    free(s_probs);
++    return loss;
++}
++
++// Find the detection layer in a network
++layer find_detection_layer(network *net) {
++    int i;
++    for (i = net->n - 1; i >= 0; i--) {
++        if (net->layers[i].type == DETECTION) {
++            return net->layers[i];
++        } else if (net->layers[i].type == YOLO) {
++            return net->layers[i];
++        }
++    }
++    // Return empty layer if not found
++    layer l = {0};
++    fprintf(stderr, "Warning: No detection/YOLO layer found in network\n");
++    return l;
++}
++
++// Process one image through both teacher and student networks
++float process_distill_image(network *teacher, network *student, char *image_path, 
++                          float temperature, int is_student_grayscale) {
++    image im;
++    
++    // Load image for teacher (always color)
++    im = load_image_color(image_path, 0, 0);
++    if (!im.data) {
++        fprintf(stderr, "Error: Could not read image %s\n", image_path);
++        return 0.0f;
++    }
++    
++    // Resize image to network dimensions
++    image sized = letterbox_image(im, teacher->w, teacher->h);
++    
++    // Run teacher network
++    network_predict(*teacher, sized.data);
++    free_image(sized);
++    
++    // Get teacher detection layer
++    layer teacher_layer = find_detection_layer(teacher);
++    if (teacher_layer.outputs <= 0) {
++        free_image(im);
++        return 0.0f;
++    }
++    
++    // Extract teacher features
++    int teacher_feature_size = 0;
++    float *teacher_features = extract_detection_features(teacher_layer, &teacher_feature_size);
++    
++    // Load image for student (grayscale if specified)
++    image im_student;
++    if (is_student_grayscale) {
++        free_image(im);  // Free the color image
++        im_student = load_image(image_path, 0, 0, 1);
++        if (!im_student.data) {
++            fprintf(stderr, "Error: Could not read grayscale image %s\n", image_path);
++            if (teacher_features) free(teacher_features);
++            return 0.0f;
++        }
++        // Convert grayscale to 3 channels for darknet
++        image rgb = make_image(im_student.w, im_student.h, 3);
++        for (int i = 0; i < im_student.w * im_student.h; ++i) {
++            rgb.data[i] = im_student.data[i];
++            rgb.data[i + im_student.w * im_student.h] = im_student.data[i];
++            rgb.data[i + 2 * im_student.w * im_student.h] = im_student.data[i];
++        }
++        free_image(im_student);
++        im_student = rgb;
++    } else {
++        im_student = copy_image(im);
++    }
++    
++    // Process student network
++    sized = letterbox_image(im_student, student->w, student->h);
++    network_predict(*student, sized.data);
++    free_image(sized);
++    free_image(im_student);
++    
++    // Get student detection layer
++    layer student_layer = find_detection_layer(student);
++    if (student_layer.outputs <= 0) {
++        free_image(im);
++        if (teacher_features) free(teacher_features);
++        return 0.0f;
++    }
++    
++    // Extract student features
++    int student_feature_size = 0;
++    float *student_features = extract_detection_features(student_layer, &student_feature_size);
++    
++    // Compute KL divergence loss
++    float loss = 0.0f;
++    if (teacher_features && student_features && 
++        teacher_feature_size > 0 && student_feature_size > 0) {
++        
++        // Make sure we have the same feature size
++        int min_size = (teacher_feature_size < student_feature_size) ? 
++                      teacher_feature_size : student_feature_size;
++        
++        loss = compute_kd_loss(teacher_features, student_features, min_size, temperature);
++    }
++    
++    // Clean up
++    if (teacher_features) free(teacher_features);
++    if (student_features) free(student_features);
++    
++    return loss;
++}
++
++// Load a batch of image paths
++char **load_image_batch(char *train_list, int batch_size, int *num_loaded) {
++    FILE *file = fopen(train_list, "r");
++    if (!file) {
++        fprintf(stderr, "Error opening file: %s\n", train_list);
++        *num_loaded = 0;
++        return NULL;
++    }
++    
++    // Count lines in file
++    int count = 0;
++    char c;
++    while ((c = fgetc(file)) != EOF) {
++        if (c == '\n') count++;
++    }
++    if (count == 0) {
++        fclose(file);
++        *num_loaded = 0;
++        return NULL;
++    }
++    
++    // Reset file pointer
++    rewind(file);
++    
++    // Read all paths
++    char **all_paths = calloc(count, sizeof(char*));
++    if (!all_paths) {
++        fprintf(stderr, "Memory allocation failed\n");
++        fclose(file);
++        *num_loaded = 0;
++        return NULL;
++    }
++    
++    char line[256];
++    int i = 0;
++    while (fgets(line, sizeof(line), file)) {
++        // Remove newline
++        size_t len = strlen(line);
++        if (len > 0 && line[len-1] == '\n') {
++            line[len-1] = '\0';
++        }
++        
++        all_paths[i] = strdup(line);
++        i++;
++    }
++    
++    fclose(file);
++    
++    // Randomly select batch_size paths
++    int size = (batch_size < count) ? batch_size : count;
++    char **batch_paths = calloc(size, sizeof(char*));
++    
++    // Seed random number generator
++    srand(time(NULL));
++    
++    // Fisher-Yates shuffle algorithm to select random paths
++    for (i = 0; i < size; i++) {
++        int j = i + rand() % (count - i);
++        batch_paths[i] = all_paths[j];
++        all_paths[j] = all_paths[i];
++    }
++    
++    // Free memory of unused paths
++    for (i = 0; i < count; i++) {
++        if (i >= size) {
++            free(all_paths[i]);
++        }
++    }
++    free(all_paths);
++    
++    *num_loaded = size;
++    return batch_paths;
++}
++
++// Main knowledge distillation training function
++void train_knowledge_distillation(kd_params params) {
++    printf("Loading teacher model: %s, %s\n", params.teacher_cfg, params.teacher_weights);
++    network *teacher = load_network(params.teacher_cfg, params.teacher_weights, 0);
++    printf("Loading student model: %s, %s\n", params.student_cfg, params.student_weights);
++    network *student = load_network(params.student_cfg, params.student_weights, 0);
++    
++    if (!teacher || !student) {
++        fprintf(stderr, "Failed to load one or both networks\n");
++        if (teacher) free_network(*teacher);
++        if (student) free_network(*student);
++        return;
++    }
++    
++    printf("Training with data from %s\n", params.train_list);
++    printf("Temperature: %f, Max batches: %d, Batch size: %d\n", 
++          params.temperature, params.max_batches, params.batch_size);
++    
++    // Set both networks to train mode
++    set_batch_network(teacher, 1);
++    set_batch_network(student, 1);
++    
++    // Create output directory if it doesn't exist
++    #ifdef _WIN32
++    system("if not exist out mkdir out");
++    #else
++    system("mkdir -p out");
++    #endif
++    
++    // Training loop
++    int i;
++    for (i = 0; i < params.max_batches; i++) {
++        clock_t time = clock();
++        
++        // Load a batch of images
++        int batch_size = 0;
++        char **batch_paths = load_image_batch(params.train_list, params.batch_size, &batch_size);
++        if (!batch_paths || batch_size == 0) {
++            fprintf(stderr, "Failed to load image batch\n");
++            continue;
++        }
++        
++        float batch_loss = 0.0f;
++        int valid_samples = 0;
++        
++        // Process each image in the batch
++        int j;
++        for (j = 0; j < batch_size; j++) {
++            float loss = process_distill_image(teacher, student, batch_paths[j], 
++                                          params.temperature, params.is_student_grayscale);
++            if (loss > 0) {
++                batch_loss += loss;
++                valid_samples++;
++            }
++        }
++        
++        // Calculate average loss
++        float avg_loss = (valid_samples > 0) ? (batch_loss / valid_samples) : 0.0f;
++        
++        // Calculate time taken
++        clock_t elapsed = clock() - time;
++        float sec = (float)elapsed / CLOCKS_PER_SEC;
++        
++        // Print progress
++        printf("Batch %d/%d, Loss: %f, Valid Samples: %d/%d, Time: %.3f sec\n", 
++              i+1, params.max_batches, avg_loss, valid_samples, batch_size, sec);
++        
++        // Save checkpoint periodically
++        if ((i + 1) % 5 == 0 || (i + 1) == params.max_batches) {
++            char buff[256];
++            sprintf(buff, "out/student_kd_checkpoint_%d.weights", i+1);
++            save_weights(*student, buff);
++        }
++        
++        // Free batch paths
++        for (j = 0; j < batch_size; j++) {
++            free(batch_paths[j]);
++        }
++        free(batch_paths);
++    }
++    
++    // Save final model
++    printf("Saving final distilled model...\n");
++    save_weights(*student, "student_distilled_final.weights");
++    printf("Knowledge distillation complete!\n");
++    
++    // Clean up
++    free_network(*teacher);
++    free_network(*student);
++}
++
++// Parse command line arguments and run knowledge distillation
++void run_knowledge_distill(int argc, char **argv) {
++    // Set default parameters
++    kd_params params = {
++        .teacher_cfg = "mycfg/yolov4-tiny_helmet.cfg",
++        .teacher_weights = "mybackup/yolov4-tiny_helmet_final.weights",
++        .student_cfg = "mycfg/yolofv1_helmetv2_reduce_filter_gray.cfg",
++        .student_weights = "mybackup/yolofv1_helmetv2_reduce_filter_gray_best.weights",
++        .train_list = NULL,
++        .temperature = 2.0,
++        .max_batches = 10000,
++        .batch_size = 16,
++        .is_student_grayscale = 1,
++        .distill_loss_weight = 0.5,
++        .detection_threshold = 0.5
++    };
++    
++    // Parse arguments
++    int i;
++    for (i = 1; i < argc; i++) {
++        if (i + 1 < argc) {
++            if (strcmp(argv[i], "-teacher_cfg") == 0) params.teacher_cfg = argv[++i];
++            else if (strcmp(argv[i], "-teacher_weights") == 0) params.teacher_weights = argv[++i];
++            else if (strcmp(argv[i], "-student_cfg") == 0) params.student_cfg = argv[++i];
++            else if (strcmp(argv[i], "-student_weights") == 0) params.student_weights = argv[++i];
++            else if (strcmp(argv[i], "-train_list") == 0) params.train_list = argv[++i];
++            else if (strcmp(argv[i], "-temperature") == 0) params.temperature = atof(argv[++i]);
++            else if (strcmp(argv[i], "-max_batches") == 0) params.max_batches = atoi(argv[++i]);
++            else if (strcmp(argv[i], "-batch_size") == 0) params.batch_size = atoi(argv[++i]);
++            else if (strcmp(argv[i], "-gray") == 0) params.is_student_grayscale = atoi(argv[++i]);
++            else if (strcmp(argv[i], "-distill_weight") == 0) params.distill_loss_weight = atof(argv[++i]);
++            else if (strcmp(argv[i], "-threshold") == 0) params.detection_threshold = atof(argv[++i]);
++        }
++    }
++    
++    // Extract train list path from data config if not provided
++    if (!params.train_list) {
++        char *data_cfg = "helmet_datasetv2_1/helmetv2.data";
++        FILE *file = fopen(data_cfg, "r");
++        if (file) {
++            char line[256];
++            while (fgets(line, sizeof(line), file)) {
++                if (strncmp(line, "train", 5) == 0) {
++                    char *equals = strchr(line, '=');
++                    if (equals) {
++                        // Skip whitespace after equals sign
++                        char *path_start = equals + 1;
++                        while (*path_start == ' ' || *path_start == '\t') {
++                            path_start++;
++                        }
++                        
++                        // Remove trailing whitespace and newline
++                        size_t len = strlen(path_start);
++                        while (len > 0 && (path_start[len-1] == '\n' || path_start[len-1] == ' ' || 
++                                          path_start[len-1] == '\t')) {
++                            len--;
++                        }
++                        
++                        params.train_list = calloc(len + 1, sizeof(char));
++                        if (params.train_list) {
++                            strncpy(params.train_list, path_start, len);
++                            params.train_list[len] = '\0';
++                        }
++                        break;
++                    }
++                }
++            }
++            fclose(file);
++        }
++    }
++    
++    // Check that we have the training list
++    if (!params.train_list) {
++        fprintf(stderr, "Error: No training list provided or found in data config\n");
++        return;
++    }
++    
++    // Run training
++    train_knowledge_distillation(params);
++    
++    // Free allocated memory if needed
++    if (params.train_list && (params.train_list != argv[i-1])) {
++        free(params.train_list);
++    }
++}
+\ No newline at end of file
+diff --git a/src/knowlege_distillation.h b/src/knowlege_distillation.h
+new file mode 100644
+index 0000000..066799b
+--- /dev/null
++++ b/src/knowlege_distillation.h
+@@ -0,0 +1,38 @@
++/**
++ * knowledge_distill.h
++ * Header file for knowledge distillation in darknet
++ */
++
++#ifndef KNOWLEDGE_DISTILL_H
++#define KNOWLEDGE_DISTILL_H
++
++#include "darknet.h"
++
++// Knowledge distillation parameters structure
++typedef struct {
++    char *teacher_cfg;
++    char *teacher_weights;
++    char *student_cfg;
++    char *student_weights;
++    char *train_list;
++    float temperature;
++    int max_batches;
++    int batch_size;
++    int is_student_grayscale;
++    float distill_loss_weight;
++    float detection_threshold;
++} kd_params;
++
++// Main function to run knowledge distillation
++void run_knowledge_distill(int argc, char **argv);
++
++// Helper functions
++float *extract_detection_features(layer l, int *feature_size);
++float compute_kd_loss(float *teacher_logits, float *student_logits, int size, float temperature);
++layer find_detection_layer(network *net);
++float process_distill_image(network *teacher, network *student, char *image_path, 
++                          float temperature, int is_student_grayscale);
++char **load_image_batch(char *train_list, int batch_size, int *num_loaded);
++void train_knowledge_distillation(kd_params params);
++
++#endif // KNOWLEDGE_DISTILL_H
+\ No newline at end of file

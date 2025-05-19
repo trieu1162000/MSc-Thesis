@@ -209,15 +209,17 @@ def train_distillation():
               f"Avg Loss: {avg_loss:.6f}, "
               f"Valid Samples: {valid_samples}/{len(batch_paths)}, "
               f"Time: {elapsed:.2f}s")
-        checkpoint_file = ""
+        
         # Save checkpoint periodically
         if (iteration + 1) % 2 == 0:
             checkpoint_file = f"out/student_kd_checkpoint_{iteration+1}.weights"
-            darknet.save_weights(student_net, checkpoint_file)
+            # Fix: Since student_net is an integer handle, pass it directly
+            darknet.save_weights(student_net, checkpoint_file.encode("ascii"))
     
     # Save final model
     print("Saving final distilled model...")
-    darknet.save_weights(student_net, "student_distilled_final.weights")
+    # Fix: Pass the handle directly to save_weights
+    darknet.save_weights(student_net, "student_distilled_final.weights".encode("ascii"))
     print("Knowledge distillation monitoring complete!")
 
 if __name__ == "__main__":
