@@ -17,7 +17,7 @@ This repository is part of my MSc thesis, focusing on deploying a YOLO-based dee
 - **[`Docs/`](./Docs/)** — Includes documentation, tutorials, and references for deploying ML/DL on ARM Cortex-M microcontrollers.  
 - **[`Dataset/`](./Dataset/)** — Stores datasets used for training and evaluation.  
 - **[`cfgs/`](./cfgs/)** — Configuration files for the deep learning model, including network architecture and inference settings.  
-- **[`Demo/`](./Demo/)** — Contains parsing scripts and example applications to test the deployed model on STM32.  
+- **[`Demo/`](./Demo/)** — Contains results, experiments and example applications to test the deployed model on STM32.  
 
 ## References
 - Model - **[`YOLOFastestv1`](https://github.com/dogqiuqiu/Yolo-Fastest)**
