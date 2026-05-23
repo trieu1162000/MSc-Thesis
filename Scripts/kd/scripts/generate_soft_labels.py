@@ -1,279 +1,290 @@
 """
 generate_soft_labels.py
 -----------------------
-Response-Based Knowledge Distillation: Soft Label Generation
-- Runs the TEACHER model (YOLOv4-tiny) on every training image
-- Merges teacher predictions with ground-truth (GT) labels using confidence weighting
-- Outputs blended label files ready for Darknet student retraining
+Knowledge Distillation via Teacher-Supervised Augmentation
 
-Teacher : yolov4-tiny_helmet.cfg  (RGB, 320x320)
-Student : yolofv1_helmetv2_reduce_filter_gray_sam_*.cfg (Grayscale, 320x320)
+Strategy:
+    The dataset is fully annotated -- teacher cannot add new boxes to original images
+    (it predicts same locations as GT). Instead, we generate AUGMENTED versions of
+    training images (flip, crop, brightness) that have no GT labels, then run the
+    TEACHER on them to produce pseudo-labels. The student trains on both:
+        - original images with GT labels       (hard supervision)
+        - augmented images with teacher labels (soft/KD supervision)
+
+Teacher : yolov4-tiny_helmet.cfg  (RGB, 320x320, high accuracy)
+Student : yolofv1_helmetv2_reduce_filter_gray_sam  (Grayscale, 320x320, MCU-deployable)
 Classes : 0=head, 1=helmet
+
+Output:
+    kd_aug_images/   - augmented image files (.jpg)
+    kd_aug_labels/   - teacher pseudo-labels for augmented images (.txt YOLO format)
+    kd_aug_train.txt - combined train list (original GT + augmented teacher-labeled)
 
 Usage:
     python generate_soft_labels.py \
-        --teacher_cfg   mycfg/yolov4-tiny_helmet.cfg \
+        --teacher_cfg     mycfg/yolov4-tiny_helmet.cfg \
         --teacher_weights mybackup/yolov4-tiny_helmet_final.weights \
-        --train_list    helmet_datasetv2_1/train.txt \
-        --gt_label_dir  helmet_datasetv2_1/labels \
-        --output_dir    helmet_kd_labels \
-        --alpha         0.5 \
-        --conf_thresh   0.30 \
-        --nms_thresh    0.45
+        --names_file      helmet_datasetv2_1/helmetv2.names \
+        --train_list      helmet_datasetv2_1/train.txt \
+        --output_img_dir  kd_aug_images \
+        --output_lbl_dir  kd_aug_labels \
+        --output_list     kd_aug_train.txt \
+        --conf_thresh     0.35 \
+        --augs_per_image  2
 
-KD blend formula (per bounding box):
-    blended_conf = alpha * teacher_conf + (1 - alpha) * 1.0   [GT boxes get conf=1.0]
-    The output label format is standard YOLO: <class> <cx> <cy> <w> <h>
-    Teacher boxes below conf_thresh are discarded (noise filter).
-    GT boxes are always kept (alpha does not remove them).
+Experiment plan (augs_per_image controls how much extra data):
+    augs_per_image=1  ->  +4912  augmented images  (1x extra)   conservative
+    augs_per_image=2  ->  +9824  augmented images  (2x extra)   recommended
+    augs_per_image=3  ->  +14736 augmented images  (3x extra)   aggressive
 """
 
 import darknet
 import cv2
 import os
 import argparse
-import shutil
+import random
+import numpy as np
 from pathlib import Path
 
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Augmentation functions
+# Each returns (augmented_image_BGR, transform_params)
+# transform_params is used to adjust GT boxes if needed (not used here since
+# teacher re-labels the augmented image directly)
+# ---------------------------------------------------------------------------
 
-def load_teacher(cfg: str, weights: str):
+def aug_horizontal_flip(img):
+    return cv2.flip(img, 1), "hflip"
+
+
+def aug_brightness(img):
+    factor = random.uniform(0.5, 1.5)
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
+    hsv[:, :, 2] = np.clip(hsv[:, :, 2] * factor, 0, 255)
+    return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR), f"bright_{factor:.2f}"
+
+
+def aug_random_crop(img, min_ratio=0.65, max_ratio=0.95):
+    h, w = img.shape[:2]
+    ratio = random.uniform(min_ratio, max_ratio)
+    new_h, new_w = int(h * ratio), int(w * ratio)
+    top  = random.randint(0, h - new_h)
+    left = random.randint(0, w - new_w)
+    cropped = img[top:top+new_h, left:left+new_w]
+    # Resize back to original size so teacher input is consistent
+    resized = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
+    return resized, f"crop_{ratio:.2f}"
+
+
+def aug_noise(img):
+    noise = np.random.normal(0, 10, img.shape).astype(np.int16)
+    noisy = np.clip(img.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+    return noisy, "noise"
+
+
+def aug_hue_shift(img):
+    shift = random.randint(-15, 15)
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.int32)
+    hsv[:, :, 0] = (hsv[:, :, 0] + shift) % 180
+    return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR), f"hue_{shift}"
+
+
+# Pool of augmentations to sample from
+AUG_POOL = [
+    aug_horizontal_flip,
+    aug_brightness,
+    aug_random_crop,
+    aug_noise,
+    aug_hue_shift,
+]
+
+
+def apply_random_aug(img):
+    """Apply 1-2 random augmentations from the pool."""
+    n = random.randint(1, 2)
+    chosen = random.sample(AUG_POOL, n)
+    tags = []
+    for fn in chosen:
+        img, tag = fn(img)
+        tags.append(tag)
+    return img, "_".join(tags)
+
+
+# ---------------------------------------------------------------------------
+# Teacher inference
+# ---------------------------------------------------------------------------
+
+def load_teacher(cfg, weights):
     net = darknet.load_net_custom(cfg.encode(), weights.encode(), 0, 1)
     w = darknet.network_width(net)
     h = darknet.network_height(net)
     return net, w, h
 
 
-def teacher_predict(net, net_w, net_h, image_path: str,
-                    conf_thresh: float, nms_thresh: float):
-    """
-    Run teacher inference on one image (RGB).
-    Returns list of (class_id, confidence, cx, cy, bw, bh) normalized to [0,1].
-    """
-    img = cv2.imread(image_path)
-    if img is None:
-        return []
+def load_class_names(names_file):
+    with open(names_file, "r") as f:
+        return [l.strip() for l in f if l.strip()]
 
-    img_h, img_w = img.shape[:2]
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+def teacher_predict(net, net_w, net_h, img_bgr, class_names, conf_thresh, nms_thresh=0.45):
+    """
+    Run teacher on a BGR numpy image.
+    Returns list of (class_id, confidence, cx, cy, bw, bh) normalized to [0,1].
+    class_names must be passed so darknet.detect_image returns proper labels.
+    """
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     img_resized = cv2.resize(img_rgb, (net_w, net_h))
 
     dk_img = darknet.make_image(net_w, net_h, 3)
     darknet.copy_image_from_bytes(dk_img, img_resized.tobytes())
-
-    # detect_image returns list of (label_str, confidence_str_or_float, (x,y,w,h))
-    # x,y,w,h are in PIXEL coords relative to net_w x net_h
-    detections = darknet.detect_image(net, [], dk_img,
+    detections = darknet.detect_image(net, class_names, dk_img,
                                       thresh=conf_thresh,
                                       hier_thresh=0.5,
                                       nms=nms_thresh)
     darknet.free_image(dk_img)
 
+    # Build name->id map from the loaded class names
+    name_to_id = {name.lower(): i for i, name in enumerate(class_names)}
+
     results = []
     for label, conf, (x, y, w, h) in detections:
-        # darknet returns class label as string index or name — map to int
-        try:
-            class_id = int(label)
-        except (ValueError, TypeError):
-            # if label is a name string, skip unknown classes
-            name_map = {"head": 0, "helmet": 1}
-            class_id = name_map.get(str(label).strip().lower(), -1)
-            if class_id == -1:
-                continue
+        label_str = str(label).strip().lower()
+        if label_str in name_to_id:
+            class_id = name_to_id[label_str]
+        else:
+            try:
+                class_id = int(label_str)
+            except ValueError:
+                continue  # unknown label, skip
 
-        # normalize to [0,1]
-        cx = x / net_w
-        cy = y / net_h
-        bw = w / net_w
-        bh = h / net_h
-
-        # clamp
-        cx = max(0.0, min(1.0, cx))
-        cy = max(0.0, min(1.0, cy))
-        bw = max(0.001, min(1.0, bw))
-        bh = max(0.001, min(1.0, bh))
-
+        cx = max(0.0, min(1.0, x / net_w))
+        cy = max(0.0, min(1.0, y / net_h))
+        bw = max(0.001, min(1.0, w / net_w))
+        bh = max(0.001, min(1.0, h / net_h))
         results.append((class_id, float(conf), cx, cy, bw, bh))
 
     return results
 
 
-def read_gt_labels(label_path: str):
-    """
-    Read ground-truth YOLO label file.
-    Returns list of (class_id, cx, cy, w, h).
-    """
-    labels = []
-    if not os.path.exists(label_path):
-        return labels
-    with open(label_path, "r") as f:
-        for line in f:
-            parts = line.strip().split()
-            if len(parts) == 5:
-                labels.append((int(parts[0]),
-                                float(parts[1]), float(parts[2]),
-                                float(parts[3]), float(parts[4])))
-    return labels
-
-
-def iou(box1, box2):
-    """Compute IoU between two (cx,cy,w,h) boxes."""
-    def to_xyxy(cx, cy, w, h):
-        return cx - w/2, cy - h/2, cx + w/2, cy + h/2
-
-    x1a, y1a, x2a, y2a = to_xyxy(*box1)
-    x1b, y1b, x2b, y2b = to_xyxy(*box2)
-
-    xi1, yi1 = max(x1a, x1b), max(y1a, y1b)
-    xi2, yi2 = min(x2a, x2b), min(y2a, y2b)
-    inter = max(0, xi2 - xi1) * max(0, yi2 - yi1)
-
-    area_a = (x2a - x1a) * (y2a - y1a)
-    area_b = (x2b - x1b) * (y2b - y1b)
-    union = area_a + area_b - inter + 1e-6
-
-    return inter / union
-
-
-def blend_labels(gt_labels, teacher_preds, alpha: float, iou_thresh: float = 0.5):
-    """
-    Merge GT labels and teacher predictions.
-
-    Rules:
-    - All GT boxes are kept as-is (hard labels, conf implicitly = 1.0).
-    - Teacher predictions that overlap a GT box (IoU > iou_thresh) are skipped
-      (GT takes priority — avoids duplication).
-    - Teacher predictions with NO GT overlap and conf >= conf_thresh are added
-      as soft boxes. These represent teacher knowledge beyond GT annotation.
-
-    The output label file uses standard YOLO format: <class> <cx> <cy> <w> <h>
-    Teacher-sourced boxes are annotated with a comment for traceability.
-
-    alpha controls how many teacher boxes survive:
-        high alpha (0.7) = trust teacher more, add more soft boxes
-        low  alpha (0.3) = conservative, only high-confidence teacher boxes
-    """
-    output_lines = []
-
-    # Always write GT boxes
-    for (cls, cx, cy, w, h) in gt_labels:
-        output_lines.append(f"{cls} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
-
-    # Add teacher boxes not covered by GT
-    for (cls, conf, cx, cy, w, h) in teacher_preds:
-        # Only add teacher boxes above alpha-scaled threshold
-        # alpha=0.5, conf=0.6 → effective threshold = 0.6 * (1/0.5) concept:
-        # simpler: just require conf >= alpha as minimum bar
-        if conf < alpha:
-            continue
-
-        # Check overlap with all GT boxes
-        overlaps_gt = any(
-            iou((cx, cy, w, h), (gcx, gcy, gw, gh)) > iou_thresh
-            for (_, gcx, gcy, gw, gh) in gt_labels
-        )
-        if overlaps_gt:
-            continue  # GT already covers this region
-
-        output_lines.append(f"{cls} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}  # teacher_soft conf={conf:.3f}")
-
-    return output_lines
-
-
-def find_label_path(image_path: str, gt_label_dir: str):
-    """Find the corresponding GT label file for an image."""
-    stem = Path(image_path).stem
-    # Try label dir first
-    candidate = os.path.join(gt_label_dir, stem + ".txt")
-    if os.path.exists(candidate):
-        return candidate
-    # Fallback: same dir as image, same name
-    fallback = str(Path(image_path).with_suffix(".txt"))
-    return fallback if os.path.exists(fallback) else None
-
-
-# ── main ─────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="KD Soft Label Generator")
-    parser.add_argument("--teacher_cfg",     required=True)
-    parser.add_argument("--teacher_weights", required=True)
-    parser.add_argument("--train_list",      required=True,
-                        help="Path to train.txt (one image path per line)")
-    parser.add_argument("--gt_label_dir",    required=True,
-                        help="Directory containing ground-truth .txt label files")
-    parser.add_argument("--output_dir",      required=True,
-                        help="Where to write blended label files")
-    parser.add_argument("--alpha",           type=float, default=0.5,
-                        help="KD blend factor (0.3 / 0.5 / 0.7 recommended)")
-    parser.add_argument("--conf_thresh",     type=float, default=0.30,
-                        help="Minimum teacher confidence to consider a detection")
-    parser.add_argument("--nms_thresh",      type=float, default=0.45)
-    parser.add_argument("--iou_thresh",      type=float, default=0.50,
-                        help="IoU threshold: teacher box suppressed if overlaps GT this much")
+    parser = argparse.ArgumentParser(description="KD via Teacher-Supervised Augmentation")
+    parser.add_argument("--teacher_cfg",      required=True)
+    parser.add_argument("--teacher_weights",  required=True)
+    parser.add_argument("--names_file",       required=True,
+                        help="Path to .names file (e.g. helmet_datasetv2_1/helmetv2.names)")
+    parser.add_argument("--train_list",       required=True,
+                        help="Original train.txt (one image path per line)")
+    parser.add_argument("--output_img_dir",   default="kd_aug_images")
+    parser.add_argument("--output_lbl_dir",   default="kd_aug_labels")
+    parser.add_argument("--output_list",      default="kd_aug_train.txt",
+                        help="Output combined train list (original + augmented)")
+    parser.add_argument("--conf_thresh",      type=float, default=0.35,
+                        help="Minimum teacher confidence to keep a pseudo-label box")
+    parser.add_argument("--nms_thresh",       type=float, default=0.45)
+    parser.add_argument("--augs_per_image",   type=int, default=2,
+                        help="How many augmented versions to generate per image")
+    parser.add_argument("--min_boxes",        type=int, default=1,
+                        help="Discard augmented image if teacher finds fewer than this many boxes")
+    parser.add_argument("--seed",             type=int, default=42)
     args = parser.parse_args()
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
 
-    print(f"[KD] Loading teacher: {args.teacher_cfg}")
+    os.makedirs(args.output_img_dir, exist_ok=True)
+    os.makedirs(args.output_lbl_dir, exist_ok=True)
+
+    print(f"[KD-AUG] Loading teacher: {args.teacher_cfg}")
     teacher_net, net_w, net_h = load_teacher(args.teacher_cfg, args.teacher_weights)
-    print(f"[KD] Teacher input: {net_w}x{net_h} RGB")
-    print(f"[KD] alpha={args.alpha}, conf_thresh={args.conf_thresh}")
+    class_names = load_class_names(args.names_file)
+    print(f"[KD-AUG] Teacher: {net_w}x{net_h} RGB  classes={class_names}")
+    print(f"[KD-AUG] augs_per_image={args.augs_per_image}, conf_thresh={args.conf_thresh}")
 
-    with open(args.train_list, "r") as f:
-        image_paths = [l.strip() for l in f if l.strip()]
+    with open(args.train_list) as f:
+        original_paths = [l.strip() for l in f if l.strip()]
 
-    total = len(image_paths)
-    stats = {"gt_only": 0, "teacher_added": 0, "no_label": 0, "errors": 0}
+    total = len(original_paths)
+    print(f"[KD-AUG] Original training images: {total}")
+    print(f"[KD-AUG] Expected augmented images: ~{total * args.augs_per_image}")
 
-    for idx, img_path in enumerate(image_paths):
+    aug_paths = []  # paths of accepted augmented images
+    stats = {"generated": 0, "accepted": 0, "rejected_no_boxes": 0, "errors": 0}
+
+    for idx, img_path in enumerate(original_paths):
         if (idx + 1) % 200 == 0 or idx == 0:
-            print(f"[KD] {idx+1}/{total}  {img_path}")
+            print(f"[KD-AUG] {idx+1}/{total}  accepted={stats['accepted']}")
 
-        # 1. Get GT labels
-        gt_path = find_label_path(img_path, args.gt_label_dir)
-        gt_labels = read_gt_labels(gt_path) if gt_path else []
-
-        # 2. Get teacher predictions
-        try:
-            teacher_preds = teacher_predict(
-                teacher_net, net_w, net_h, img_path,
-                args.conf_thresh, args.nms_thresh
-            )
-        except Exception as e:
-            print(f"[KD] WARNING: teacher failed on {img_path}: {e}")
-            teacher_preds = []
+        img_bgr = cv2.imread(img_path)
+        if img_bgr is None:
             stats["errors"] += 1
+            continue
 
-        # 3. Blend
-        blended = blend_labels(gt_labels, teacher_preds, args.alpha, args.iou_thresh)
-        added = len(blended) - len(gt_labels)
-        if added > 0:
-            stats["teacher_added"] += 1
-        elif not gt_labels:
-            stats["no_label"] += 1
-        else:
-            stats["gt_only"] += 1
+        for aug_i in range(args.augs_per_image):
+            stats["generated"] += 1
 
-        # 4. Write output label file (same stem as image)
-        out_name = Path(img_path).stem + ".txt"
-        out_path = os.path.join(args.output_dir, out_name)
-        with open(out_path, "w") as f:
-            f.write("\n".join(blended) + ("\n" if blended else ""))
+            # 1. Augment
+            try:
+                aug_img, aug_tag = apply_random_aug(img_bgr.copy())
+            except Exception as e:
+                stats["errors"] += 1
+                continue
 
-    print("\n[KD] ── Summary ──────────────────────────────")
-    print(f"  Total images     : {total}")
-    print(f"  GT only (no new) : {stats['gt_only']}")
-    print(f"  Teacher added    : {stats['teacher_added']}  ← teacher contributed new boxes")
-    print(f"  No GT label      : {stats['no_label']}")
-    print(f"  Errors           : {stats['errors']}")
-    print(f"  Output dir       : {args.output_dir}")
-    print("[KD] ─────────────────────────────────────────")
-    print("[KD] Done. Next step: update your Darknet .data config to point to these labels.")
-    print(f"[KD] Suggested config name: helmetv2_kd_a{int(args.alpha*10):02d}.data")
+            # 2. Teacher labels augmented image
+            try:
+                preds = teacher_predict(teacher_net, net_w, net_h,
+                                        aug_img, class_names, args.conf_thresh, args.nms_thresh)
+            except Exception as e:
+                stats["errors"] += 1
+                continue
+
+            # 3. Reject if too few boxes (likely background crop or bad aug)
+            if len(preds) < args.min_boxes:
+                stats["rejected_no_boxes"] += 1
+                continue
+
+            # 4. Save augmented image
+            stem = Path(img_path).stem
+            out_name = f"{stem}_kd_{aug_i}_{aug_tag}"
+            img_out = os.path.join(args.output_img_dir, out_name + ".jpg")
+            cv2.imwrite(img_out, aug_img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+            # 5. Save pseudo-label (YOLO format)
+            lbl_out = os.path.join(args.output_lbl_dir, out_name + ".txt")
+            with open(lbl_out, "w") as f:
+                for (cls, conf, cx, cy, bw, bh) in preds:
+                    f.write(f"{cls} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
+
+            aug_paths.append(img_out)
+            stats["accepted"] += 1
+
+    # 6. Write combined train list: original + augmented
+    with open(args.output_list, "w") as f:
+        for p in original_paths:
+            f.write(p + "\n")
+        for p in aug_paths:
+            f.write(p + "\n")
+
+    accept_rate = stats["accepted"] / max(stats["generated"], 1) * 100
+    print("\n[KD-AUG] ── Summary ────────────────────────────────────")
+    print(f"  Original images    : {total}")
+    print(f"  Augmented generated: {stats['generated']}")
+    print(f"  Accepted (has boxes): {stats['accepted']}  ({accept_rate:.1f}%)")
+    print(f"  Rejected (no boxes): {stats['rejected_no_boxes']}")
+    print(f"  Errors             : {stats['errors']}")
+    print(f"  Total in train list: {total + stats['accepted']}")
+    print(f"  Output train list  : {args.output_list}")
+    print(f"  Augmented images   : {args.output_img_dir}/")
+    print(f"  Pseudo-labels      : {args.output_lbl_dir}/")
+    print("[KD-AUG] ─────────────────────────────────────────────────")
+    print("[KD-AUG] Done.")
+    print(f"[KD-AUG] Next: create a Darknet .data config with train={args.output_list}")
+    print(f"[KD-AUG]       and labels pointing to both GT and {args.output_lbl_dir}/")
 
 
 if __name__ == "__main__":
     main()
-
