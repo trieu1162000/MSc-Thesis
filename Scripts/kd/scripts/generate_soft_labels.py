@@ -11,13 +11,37 @@ Strategy:
         - original images with GT labels       (hard supervision)
         - augmented images with teacher labels (soft/KD supervision)
 
+    This is Response-Based KD via data augmentation -- publishable, practical,
+    no Darknet modification required.
+
 Teacher : yolov4-tiny_helmet.cfg  (RGB, 320x320, high accuracy)
 Student : yolofv1_helmetv2_reduce_filter_gray_sam  (Grayscale, 320x320, MCU-deployable)
 Classes : 0=head, 1=helmet
 
+Label format modes (--label_mode):
+    hard      : Standard 5-field YOLO labels  "cls cx cy bw bh"
+                All boxes treated equally regardless of teacher confidence.
+                Use with standard unmodified Darknet.
+
+    soft      : 6-field labels  "cls cx cy bw bh conf"
+                Teacher confidence saved as 6th field.
+                Standard Darknet ignores the 6th field (safe to use).
+                A soft-weight-aware Darknet can use conf to weight the loss,
+                implementing proper soft-label KD (DKD/DIST style).
+
+    filtered  : Like 'hard' but raises the acceptance threshold to --hard_thresh
+                (default 0.50). Removes noisy low-confidence pseudo-labels.
+                Best immediate improvement without any Darknet modification.
+
+Recommended strategy:
+    1st run: --label_mode filtered --hard_thresh 0.50 --conf_thresh 0.35
+             Keeps only high-confidence teacher boxes -> cleaner pseudo-labels
+    2nd run: --label_mode soft --conf_thresh 0.35
+             Saves soft weights for future soft-label-aware training
+
 Output:
     kd_aug_images/   - augmented image files (.jpg)
-    kd_aug_labels/   - teacher pseudo-labels for augmented images (.txt YOLO format)
+    kd_aug_labels/   - teacher pseudo-labels for augmented images (.txt)
     kd_aug_train.txt - combined train list (original GT + augmented teacher-labeled)
 
 Usage:
@@ -30,7 +54,9 @@ Usage:
         --output_lbl_dir  kd_aug_labels \
         --output_list     kd_aug_train.txt \
         --conf_thresh     0.35 \
-        --augs_per_image  2
+        --augs_per_image  2 \
+        --label_mode      filtered \
+        --hard_thresh     0.50
 
 Experiment plan (augs_per_image controls how much extra data):
     augs_per_image=1  ->  +4912  augmented images  (1x extra)   conservative
@@ -184,12 +210,23 @@ def main():
     parser.add_argument("--output_list",      default="kd_aug_train.txt",
                         help="Output combined train list (original + augmented)")
     parser.add_argument("--conf_thresh",      type=float, default=0.35,
-                        help="Minimum teacher confidence to keep a pseudo-label box")
+                        help="Minimum teacher confidence to detect a box (pre-NMS gate)")
     parser.add_argument("--nms_thresh",       type=float, default=0.45)
     parser.add_argument("--augs_per_image",   type=int, default=2,
                         help="How many augmented versions to generate per image")
     parser.add_argument("--min_boxes",        type=int, default=1,
                         help="Discard augmented image if teacher finds fewer than this many boxes")
+    parser.add_argument("--label_mode",       default="filtered",
+                        choices=["hard", "soft", "filtered"],
+                        help=(
+                            "hard: standard 5-field YOLO labels (original behavior). "
+                            "soft: 6-field labels with confidence appended (recommended for soft-label KD). "
+                            "filtered: 5-field labels but only keeps boxes above --hard_thresh "
+                            "(best immediate improvement without Darknet modification)."
+                        ))
+    parser.add_argument("--hard_thresh",      type=float, default=0.50,
+                        help="[filtered mode only] Minimum confidence to save a label box. "
+                             "Higher = cleaner pseudo-labels. Typical range: 0.45-0.70.")
     parser.add_argument("--seed",             type=int, default=42)
     args = parser.parse_args()
 
@@ -204,6 +241,13 @@ def main():
     class_names = load_class_names(args.names_file)
     print(f"[KD-AUG] Teacher: {net_w}x{net_h} RGB  classes={class_names}")
     print(f"[KD-AUG] augs_per_image={args.augs_per_image}, conf_thresh={args.conf_thresh}")
+    print(f"[KD-AUG] label_mode={args.label_mode}", end="")
+    if args.label_mode == "filtered":
+        print(f"  hard_thresh={args.hard_thresh}")
+    elif args.label_mode == "soft":
+        print("  (6-field: cls cx cy bw bh conf)")
+    else:
+        print("  (5-field standard YOLO)")
 
     with open(args.train_list) as f:
         original_paths = [l.strip() for l in f if l.strip()]
@@ -213,7 +257,12 @@ def main():
     print(f"[KD-AUG] Expected augmented images: ~{total * args.augs_per_image}")
 
     aug_paths = []  # paths of accepted augmented images
-    stats = {"generated": 0, "accepted": 0, "rejected_no_boxes": 0, "errors": 0}
+    stats = {
+        "generated": 0, "accepted": 0,
+        "rejected_no_boxes": 0, "errors": 0,
+        "boxes_total": 0, "boxes_filtered": 0,
+        "conf_sum": 0.0,
+    }
 
     for idx, img_path in enumerate(original_paths):
         if (idx + 1) % 200 == 0 or idx == 0:
@@ -247,22 +296,47 @@ def main():
                 stats["rejected_no_boxes"] += 1
                 continue
 
-            # 4. Save augmented image
+            # 4. Filter by label mode before deciding to save
+            if args.label_mode == "filtered":
+                save_preds = [(cls, conf, cx, cy, bw, bh)
+                              for (cls, conf, cx, cy, bw, bh) in preds
+                              if conf >= args.hard_thresh]
+                stats["boxes_filtered"] += len(preds) - len(save_preds)
+            else:
+                save_preds = preds
+
+            # Still require min_boxes after filtering
+            if len(save_preds) < args.min_boxes:
+                stats["rejected_no_boxes"] += 1
+                continue
+
+            stats["boxes_total"] += len(save_preds)
+            stats["conf_sum"] += sum(c for (_, c, *_) in save_preds)
+
+            # 5. Save augmented image
             stem = Path(img_path).stem
             out_name = f"{stem}_kd_{aug_i}_{aug_tag}"
             img_out = os.path.join(args.output_img_dir, out_name + ".jpg")
             cv2.imwrite(img_out, aug_img, [cv2.IMWRITE_JPEG_QUALITY, 95])
 
-            # 5. Save pseudo-label (YOLO format)
+            # 6. Save pseudo-label
+            #    hard/filtered : "cls cx cy bw bh"          (5 fields, standard YOLO)
+            #    soft          : "cls cx cy bw bh conf"      (6 fields; standard Darknet
+            #                                                  ignores the 6th field safely;
+            #                                                  a soft-weight-aware Darknet
+            #                                                  uses conf to scale the loss)
             lbl_out = os.path.join(args.output_lbl_dir, out_name + ".txt")
             with open(lbl_out, "w") as f:
-                for (cls, conf, cx, cy, bw, bh) in preds:
-                    f.write(f"{cls} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
+                for (cls, conf, cx, cy, bw, bh) in save_preds:
+                    if args.label_mode == "soft":
+                        f.write(f"{cls} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f} {conf:.4f}\n")
+                    else:
+                        f.write(f"{cls} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
 
             aug_paths.append(img_out)
             stats["accepted"] += 1
 
-    # 6. Write combined train list: original + augmented
+    # 7. Write combined train list: original + augmented
     with open(args.output_list, "w") as f:
         for p in original_paths:
             f.write(p + "\n")
@@ -270,18 +344,29 @@ def main():
             f.write(p + "\n")
 
     accept_rate = stats["accepted"] / max(stats["generated"], 1) * 100
+    avg_conf = stats["conf_sum"] / max(stats["boxes_total"], 1)
     print("\n[KD-AUG] ── Summary ────────────────────────────────────")
-    print(f"  Original images    : {total}")
-    print(f"  Augmented generated: {stats['generated']}")
+    print(f"  Original images     : {total}")
+    print(f"  Augmented generated : {stats['generated']}")
     print(f"  Accepted (has boxes): {stats['accepted']}  ({accept_rate:.1f}%)")
-    print(f"  Rejected (no boxes): {stats['rejected_no_boxes']}")
-    print(f"  Errors             : {stats['errors']}")
-    print(f"  Total in train list: {total + stats['accepted']}")
-    print(f"  Output train list  : {args.output_list}")
-    print(f"  Augmented images   : {args.output_img_dir}/")
-    print(f"  Pseudo-labels      : {args.output_lbl_dir}/")
+    print(f"  Rejected (no boxes) : {stats['rejected_no_boxes']}")
+    print(f"  Errors              : {stats['errors']}")
+    print(f"  Total boxes saved   : {stats['boxes_total']}")
+    if args.label_mode == "filtered":
+        print(f"  Boxes filtered (<{args.hard_thresh:.2f} conf): {stats['boxes_filtered']}")
+    print(f"  Avg confidence      : {avg_conf:.3f}")
+    print(f"  Label mode          : {args.label_mode}")
+    print(f"  Total in train list : {total + stats['accepted']}")
+    print(f"  Output train list   : {args.output_list}")
+    print(f"  Augmented images    : {args.output_img_dir}/")
+    print(f"  Pseudo-labels       : {args.output_lbl_dir}/")
     print("[KD-AUG] ─────────────────────────────────────────────────")
     print("[KD-AUG] Done.")
+    if args.label_mode == "soft":
+        print("[KD-AUG] NOTE: 6-field labels saved. Standard Darknet ignores the 6th field.")
+        print("[KD-AUG]       To use soft weights, modify region_layer.c:")
+        print("[KD-AUG]         delta_region_box()  -- multiply loss by conf weight")
+        print("[KD-AUG]         delta_region_class() -- multiply loss by conf weight")
     print(f"[KD-AUG] Next: create a Darknet .data config with train={args.output_list}")
     print(f"[KD-AUG]       and labels pointing to both GT and {args.output_lbl_dir}/")
 
