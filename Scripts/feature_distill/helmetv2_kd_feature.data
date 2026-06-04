@@ -1,0 +1,19 @@
+# KD Training data config — add this to your existing .data file on Colab
+# OR use it as a separate .data file that references the same train/valid/test sets
+
+classes = 2
+train   = helmet_datasetv2_1/train.txt
+valid   = helmet_datasetv2_1/valid.txt
+names   = helmet_datasetv2_1/helmetv2.names
+backup  = mybackup
+
+# ── Knowledge Distillation settings ──────────────────────────────────────────
+# Teacher: YOLOv4-tiny (91.18% mAP on test.txt, too large for STM32)
+# Student: YOLOFastest _2samv2 (80.41% mAP, fits STM32)
+teacher_cfg     = mycfg/yolov4-tiny_helmet.cfg
+teacher_weights = mybackup/yolov4-tiny_helmet_final.weights
+
+# KD loss weight — raised to 0.3 now that soft-weighting (not hard threshold) is used
+#   Hard threshold (0.5) was firing on <2% of cells → effectively no KD signal
+#   Soft weighting fires everywhere, so lower effective weight per-cell; 0.3 overall is safe
+kd_weight = 0.3
